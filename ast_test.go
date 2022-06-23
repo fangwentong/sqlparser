@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,16 +24,16 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/xwb1989/sqlparser/dependency/sqltypes"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAppend(t *testing.T) {
 	query := "select * from t where a = 1"
 	tree, err := Parse(query)
-	if err != nil {
-		t.Error(err)
-	}
-	var b bytes.Buffer
+	require.NoError(t, err)
+	var b strings.Builder
 	Append(&b, tree)
 	got := b.String()
 	want := query
@@ -50,9 +50,7 @@ func TestAppend(t *testing.T) {
 
 func TestSelect(t *testing.T) {
 	tree, err := Parse("select * from t where a = 1")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	expr := tree.(*Select).Where.Expr
 
 	sel := &Select{}
@@ -86,17 +84,14 @@ func TestSelect(t *testing.T) {
 		t.Errorf("having: %q, want %s", buf.String(), want)
 	}
 
-	// OR clauses must be parenthesized.
 	tree, err = Parse("select * from t where a = 1 or b = 1")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	expr = tree.(*Select).Where.Expr
 	sel = &Select{}
 	sel.AddWhere(expr)
 	buf = NewTrackedBuffer(nil)
 	sel.Where.Format(buf)
-	want = " where (a = 1 or b = 1)"
+	want = " where a = 1 or b = 1"
 	if buf.String() != want {
 		t.Errorf("where: %q, want %s", buf.String(), want)
 	}
@@ -104,10 +99,32 @@ func TestSelect(t *testing.T) {
 	sel.AddHaving(expr)
 	buf = NewTrackedBuffer(nil)
 	sel.Having.Format(buf)
-	want = " having (a = 1 or b = 1)"
+	want = " having a = 1 or b = 1"
 	if buf.String() != want {
 		t.Errorf("having: %q, want %s", buf.String(), want)
 	}
+}
+
+func TestUpdate(t *testing.T) {
+	tree, err := Parse("update t set a = 1")
+	require.NoError(t, err)
+
+	upd, ok := tree.(*Update)
+	require.True(t, ok)
+
+	upd.AddWhere(&ComparisonExpr{
+		Left:     &ColName{Name: NewColIdent("b")},
+		Operator: EqualOp,
+		Right:    NewIntLiteral("2"),
+	})
+	assert.Equal(t, "update t set a = 1 where b = 2", String(upd))
+
+	upd.AddWhere(&ComparisonExpr{
+		Left:     &ColName{Name: NewColIdent("c")},
+		Operator: EqualOp,
+		Right:    NewIntLiteral("3"),
+	})
+	assert.Equal(t, "update t set a = 1 where b = 2 and c = 3", String(upd))
 }
 
 func TestRemoveHints(t *testing.T) {
@@ -133,62 +150,215 @@ func TestRemoveHints(t *testing.T) {
 
 func TestAddOrder(t *testing.T) {
 	src, err := Parse("select foo, bar from baz order by foo")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	order := src.(*Select).OrderBy[0]
 	dst, err := Parse("select * from t")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	dst.(*Select).AddOrder(order)
 	buf := NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want := "select * from t order by foo asc"
-	if buf.String() != want {
-		t.Errorf("order: %q, want %s", buf.String(), want)
-	}
+	require.Equal(t, "select * from t order by foo asc", buf.String())
 	dst, err = Parse("select * from t union select * from s")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	dst.(*Union).AddOrder(order)
 	buf = NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want = "select * from t union select * from s order by foo asc"
-	if buf.String() != want {
-		t.Errorf("order: %q, want %s", buf.String(), want)
-	}
+	require.Equal(t, "select * from t union select * from s order by foo asc", buf.String())
 }
 
 func TestSetLimit(t *testing.T) {
 	src, err := Parse("select foo, bar from baz limit 4")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	limit := src.(*Select).Limit
 	dst, err := Parse("select * from t")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	dst.(*Select).SetLimit(limit)
 	buf := NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want := "select * from t limit 4"
-	if buf.String() != want {
-		t.Errorf("limit: %q, want %s", buf.String(), want)
-	}
+	require.Equal(t, "select * from t limit 4", buf.String())
 	dst, err = Parse("select * from t union select * from s")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	dst.(*Union).SetLimit(limit)
 	buf = NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want = "select * from t union select * from s limit 4"
-	if buf.String() != want {
-		t.Errorf("order: %q, want %s", buf.String(), want)
+	require.Equal(t, "select * from t union select * from s limit 4", buf.String())
+}
+
+func TestDDL(t *testing.T) {
+	testcases := []struct {
+		query    string
+		output   DDLStatement
+		affected []string
+	}{{
+		query: "create table a",
+		output: &CreateTable{
+			Table: TableName{Name: NewTableIdent("a")},
+		},
+		affected: []string{"a"},
+	}, {
+		query: "rename table a to b",
+		output: &RenameTable{
+			TablePairs: []*RenameTablePair{
+				{
+					FromTable: TableName{Name: NewTableIdent("a")},
+					ToTable:   TableName{Name: NewTableIdent("b")},
+				},
+			},
+		},
+		affected: []string{"a", "b"},
+	}, {
+		query: "rename table a to b, c to d",
+		output: &RenameTable{
+			TablePairs: []*RenameTablePair{
+				{
+					FromTable: TableName{Name: NewTableIdent("a")},
+					ToTable:   TableName{Name: NewTableIdent("b")},
+				}, {
+					FromTable: TableName{Name: NewTableIdent("c")},
+					ToTable:   TableName{Name: NewTableIdent("d")},
+				},
+			},
+		},
+		affected: []string{"a", "b", "c", "d"},
+	}, {
+		query: "drop table a",
+		output: &DropTable{
+			FromTables: TableNames{
+				TableName{Name: NewTableIdent("a")},
+			},
+		},
+		affected: []string{"a"},
+	}, {
+		query: "drop table a, b",
+		output: &DropTable{
+			FromTables: TableNames{
+				TableName{Name: NewTableIdent("a")},
+				TableName{Name: NewTableIdent("b")},
+			},
+		},
+		affected: []string{"a", "b"},
+	}}
+	for _, tcase := range testcases {
+		got, err := Parse(tcase.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, tcase.output) {
+			t.Errorf("%s: %v, want %v", tcase.query, got, tcase.output)
+		}
+		want := make(TableNames, 0, len(tcase.affected))
+		for _, t := range tcase.affected {
+			want = append(want, TableName{Name: NewTableIdent(t)})
+		}
+		if affected := got.(DDLStatement).AffectedTables(); !reflect.DeepEqual(affected, want) {
+			t.Errorf("Affected(%s): %v, want %v", tcase.query, affected, want)
+		}
 	}
+}
+
+func TestSetAutocommitON(t *testing.T) {
+	stmt, err := Parse("SET autocommit=ON")
+	require.NoError(t, err)
+	s, ok := stmt.(*Set)
+	if !ok {
+		t.Errorf("SET statement is not Set: %T", s)
+	}
+
+	if len(s.Exprs) < 1 {
+		t.Errorf("SET statement has no expressions")
+	}
+
+	e := s.Exprs[0]
+	switch v := e.Expr.(type) {
+	case *Literal:
+		if v.Type != StrVal {
+			t.Errorf("SET statement value is not StrVal: %T", v)
+		}
+
+		if "on" != v.Val {
+			t.Errorf("SET statement value want: on, got: %s", v.Val)
+		}
+	default:
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
+	}
+
+	stmt, err = Parse("SET @@session.autocommit=ON")
+	require.NoError(t, err)
+	s, ok = stmt.(*Set)
+	if !ok {
+		t.Errorf("SET statement is not Set: %T", s)
+	}
+
+	if len(s.Exprs) < 1 {
+		t.Errorf("SET statement has no expressions")
+	}
+
+	e = s.Exprs[0]
+	switch v := e.Expr.(type) {
+	case *Literal:
+		if v.Type != StrVal {
+			t.Errorf("SET statement value is not StrVal: %T", v)
+		}
+
+		if "on" != v.Val {
+			t.Errorf("SET statement value want: on, got: %s", v.Val)
+		}
+	default:
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
+	}
+}
+
+func TestSetAutocommitOFF(t *testing.T) {
+	stmt, err := Parse("SET autocommit=OFF")
+	require.NoError(t, err)
+	s, ok := stmt.(*Set)
+	if !ok {
+		t.Errorf("SET statement is not Set: %T", s)
+	}
+
+	if len(s.Exprs) < 1 {
+		t.Errorf("SET statement has no expressions")
+	}
+
+	e := s.Exprs[0]
+	switch v := e.Expr.(type) {
+	case *Literal:
+		if v.Type != StrVal {
+			t.Errorf("SET statement value is not StrVal: %T", v)
+		}
+
+		if "off" != v.Val {
+			t.Errorf("SET statement value want: on, got: %s", v.Val)
+		}
+	default:
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
+	}
+
+	stmt, err = Parse("SET @@session.autocommit=OFF")
+	require.NoError(t, err)
+	s, ok = stmt.(*Set)
+	if !ok {
+		t.Errorf("SET statement is not Set: %T", s)
+	}
+
+	if len(s.Exprs) < 1 {
+		t.Errorf("SET statement has no expressions")
+	}
+
+	e = s.Exprs[0]
+	switch v := e.Expr.(type) {
+	case *Literal:
+		if v.Type != StrVal {
+			t.Errorf("SET statement value is not StrVal: %T", v)
+		}
+
+		if "off" != v.Val {
+			t.Errorf("SET statement value want: on, got: %s", v.Val)
+		}
+	default:
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
+	}
+
 }
 
 func TestWhere(t *testing.T) {
@@ -198,7 +368,7 @@ func TestWhere(t *testing.T) {
 	if buf.String() != "" {
 		t.Errorf("w.Format(nil): %q, want \"\"", buf.String())
 	}
-	w = NewWhere(WhereStr, nil)
+	w = NewWhere(WhereClause, nil)
 	buf = NewTrackedBuffer(nil)
 	w.Format(buf)
 	if buf.String() != "" {
@@ -220,6 +390,35 @@ func TestIsAggregate(t *testing.T) {
 	f = FuncExpr{Name: NewColIdent("foo")}
 	if f.IsAggregate() {
 		t.Error("IsAggregate: true, want false")
+	}
+}
+
+func TestIsImpossible(t *testing.T) {
+	f := ComparisonExpr{
+		Operator: NotEqualOp,
+		Left:     NewIntLiteral("1"),
+		Right:    NewIntLiteral("1"),
+	}
+	if !f.IsImpossible() {
+		t.Error("IsImpossible: false, want true")
+	}
+
+	f = ComparisonExpr{
+		Operator: EqualOp,
+		Left:     NewIntLiteral("1"),
+		Right:    NewIntLiteral("1"),
+	}
+	if f.IsImpossible() {
+		t.Error("IsImpossible: true, want false")
+	}
+
+	f = ComparisonExpr{
+		Operator: NotEqualOp,
+		Left:     NewIntLiteral("1"),
+		Right:    NewIntLiteral("2"),
+	}
+	if f.IsImpossible() {
+		t.Error("IsImpossible: true, want false")
 	}
 }
 
@@ -246,7 +445,7 @@ func TestReplaceExpr(t *testing.T) {
 		out: "not :a",
 	}, {
 		in:  "select * from t where ((select a from b))",
-		out: "(:a)",
+		out: ":a",
 	}, {
 		in:  "select * from t where (select a from b) = 1",
 		out: ":a = 1",
@@ -345,7 +544,7 @@ func TestReplaceExpr(t *testing.T) {
 		in:  "select * from t where case a when b then c when d then c else (select a from b) end",
 		out: "case a when b then c when d then c else :a end",
 	}}
-	to := NewValArg([]byte(":a"))
+	to := NewArgument("a")
 	for _, tcase := range tcases {
 		tree, err := Parse(tcase.in)
 		if err != nil {
@@ -366,47 +565,6 @@ func TestReplaceExpr(t *testing.T) {
 		got := String(expr)
 		if tcase.out != got {
 			t.Errorf("ReplaceExpr(%s): %s, want %s", tcase.in, got, tcase.out)
-		}
-	}
-}
-
-func TestExprFromValue(t *testing.T) {
-	tcases := []struct {
-		in  sqltypes.Value
-		out SQLNode
-		err string
-	}{{
-		in:  sqltypes.NULL,
-		out: &NullVal{},
-	}, {
-		in:  sqltypes.NewInt64(1),
-		out: NewIntVal([]byte("1")),
-	}, {
-		in:  sqltypes.NewFloat64(1.1),
-		out: NewFloatVal([]byte("1.1")),
-	}, {
-		in:  sqltypes.MakeTrusted(sqltypes.Decimal, []byte("1.1")),
-		out: NewFloatVal([]byte("1.1")),
-	}, {
-		in:  sqltypes.NewVarChar("aa"),
-		out: NewStrVal([]byte("aa")),
-	}, {
-		in:  sqltypes.MakeTrusted(sqltypes.Expression, []byte("rand()")),
-		err: "cannot convert value EXPRESSION(rand()) to AST",
-	}}
-	for _, tcase := range tcases {
-		got, err := ExprFromValue(tcase.in)
-		if tcase.err != "" {
-			if err == nil || err.Error() != tcase.err {
-				t.Errorf("ExprFromValue(%v) err: %v, want %s", tcase.in, err, tcase.err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Error(err)
-		}
-		if got, want := got, tcase.out; !reflect.DeepEqual(got, want) {
-			t.Errorf("ExprFromValue(%v): %v, want %s", tcase.in, got, want)
 		}
 	}
 }
@@ -476,7 +634,7 @@ func TestColIdentMarshal(t *testing.T) {
 
 func TestColIdentSize(t *testing.T) {
 	size := unsafe.Sizeof(NewColIdent(""))
-	want := 2 * unsafe.Sizeof("")
+	want := 2*unsafe.Sizeof("") + 8
 	if size != want {
 		t.Errorf("Size of ColIdent: %d, want 32", want)
 	}
@@ -516,7 +674,7 @@ func TestHexDecode(t *testing.T) {
 		out: "encoding/hex: odd length hex string",
 	}}
 	for _, tc := range testcase {
-		out, err := newHexVal(tc.in).HexDecode()
+		out, err := NewHexLiteral(tc.in).HexDecode()
 		if err != nil {
 			if err.Error() != tc.out {
 				t.Errorf("Decode(%q): %v, want %s", tc.in, err, tc.out)
@@ -595,7 +753,16 @@ func TestSplitStatementToPieces(t *testing.T) {
 		input  string
 		output string
 	}{{
+		input:  "select * from table1; \t; \n; \n\t\t ;select * from table1;",
+		output: "select * from table1;select * from table1",
+	}, {
 		input: "select * from table",
+	}, {
+		input:  "select * from table;",
+		output: "select * from table",
+	}, {
+		input:  "select * from table;   ",
+		output: "select * from table",
 	}, {
 		input:  "select * from table1; select * from table2;",
 		output: "select * from table1; select * from table2",
@@ -618,19 +785,64 @@ func TestSplitStatementToPieces(t *testing.T) {
 	}}
 
 	for _, tcase := range testcases {
-		if tcase.output == "" {
-			tcase.output = tcase.input
-		}
+		t.Run(tcase.input, func(t *testing.T) {
+			if tcase.output == "" {
+				tcase.output = tcase.input
+			}
 
-		stmtPieces, err := SplitStatementToPieces(tcase.input)
-		if err != nil {
-			t.Errorf("input: %s, err: %v", tcase.input, err)
-			continue
-		}
+			stmtPieces, err := SplitStatementToPieces(tcase.input)
+			require.NoError(t, err)
 
-		out := strings.Join(stmtPieces, ";")
-		if out != tcase.output {
-			t.Errorf("out: %s, want %s", out, tcase.output)
-		}
+			out := strings.Join(stmtPieces, ";")
+			require.Equal(t, tcase.output, out)
+		})
+	}
+}
+
+func TestTypeConversion(t *testing.T) {
+	ct1 := &ColumnType{Type: "BIGINT"}
+	ct2 := &ColumnType{Type: "bigint"}
+	assert.Equal(t, ct1.SQLType(), ct2.SQLType())
+}
+
+func TestDefaultStatus(t *testing.T) {
+	assert.Equal(t,
+		String(&Default{ColName: "status"}),
+		"default(`status`)")
+}
+
+func TestShowTableStatus(t *testing.T) {
+	query := "Show Table Status FROM customer"
+	tree, err := Parse(query)
+	require.NoError(t, err)
+	require.NotNil(t, tree)
+}
+
+func BenchmarkStringTraces(b *testing.B) {
+	for _, trace := range []string{"django_queries.txt", "lobsters.sql.gz"} {
+		b.Run(trace, func(b *testing.B) {
+			queries := loadQueries(b, trace)
+			if len(queries) > 10000 {
+				queries = queries[:10000]
+			}
+
+			parsed := make([]Statement, 0, len(queries))
+			for _, q := range queries {
+				pp, err := Parse(q)
+				if err != nil {
+					b.Fatal(err)
+				}
+				parsed = append(parsed, pp)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				for _, stmt := range parsed {
+					_ = String(stmt)
+				}
+			}
+		})
 	}
 }

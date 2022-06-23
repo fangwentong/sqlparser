@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,12 @@ limitations under the License.
 package sqlparser
 
 import (
-	"fmt"
-
-	"github.com/xwb1989/sqlparser/dependency/sqltypes"
-
-	"github.com/xwb1989/sqlparser/dependency/querypb"
+	sqltypes2 "github.com/xwb1989/sqlparser/internal/dependency/sqltypes"
+	querypb "github.com/xwb1989/sqlparser/internal/dependency/vt/proto/query"
 )
+
+// BindVars is a set of reserved bind variables from a SQL statement
+type BindVars map[string]struct{}
 
 // Normalize changes the statement to use bind values, and
 // updates the bind vars to those values. The supplied prefix
@@ -31,27 +31,23 @@ import (
 // Within Select constructs, bind vars are deduped. This allows
 // us to identify vindex equality. Otherwise, every value is
 // treated as distinct.
-func Normalize(stmt Statement, bindVars map[string]*querypb.BindVariable, prefix string) {
-	nz := newNormalizer(stmt, bindVars, prefix)
-	_ = Walk(nz.WalkStatement, stmt)
+func Normalize(stmt Statement, reserved *ReservedVars, bindVars map[string]*querypb.BindVariable) error {
+	nz := newNormalizer(reserved, bindVars)
+	_ = Rewrite(stmt, nz.WalkStatement, nil)
+	return nz.err
 }
 
 type normalizer struct {
-	stmt     Statement
 	bindVars map[string]*querypb.BindVariable
-	prefix   string
-	reserved map[string]struct{}
-	counter  int
+	reserved *ReservedVars
 	vals     map[string]string
+	err      error
 }
 
-func newNormalizer(stmt Statement, bindVars map[string]*querypb.BindVariable, prefix string) *normalizer {
+func newNormalizer(reserved *ReservedVars, bindVars map[string]*querypb.BindVariable) *normalizer {
 	return &normalizer{
-		stmt:     stmt,
 		bindVars: bindVars,
-		prefix:   prefix,
-		reserved: GetBindvars(stmt),
-		counter:  1,
+		reserved: reserved,
 		vals:     make(map[string]string),
 	}
 }
@@ -59,38 +55,57 @@ func newNormalizer(stmt Statement, bindVars map[string]*querypb.BindVariable, pr
 // WalkStatement is the top level walk function.
 // If it encounters a Select, it switches to a mode
 // where variables are deduped.
-func (nz *normalizer) WalkStatement(node SQLNode) (bool, error) {
-	switch node := node.(type) {
+func (nz *normalizer) WalkStatement(cursor *Cursor) bool {
+	switch node := cursor.Node().(type) {
+	// no need to normalize the statement types
+	case *Set, *Show, *Begin, *Commit, *Rollback, *Savepoint, *SetTransaction, DDLStatement, *SRollback, *Release, *OtherAdmin, *OtherRead:
+		return false
 	case *Select:
-		_ = Walk(nz.WalkSelect, node)
+		_ = Rewrite(node, nz.WalkSelect, nil)
 		// Don't continue
-		return false, nil
-	case *SQLVal:
-		nz.convertSQLVal(node)
+		return false
+	case *Literal:
+		nz.convertLiteral(node, cursor)
 	case *ComparisonExpr:
 		nz.convertComparison(node)
+	case *ColName, TableName:
+		// Common node types that never contain Literal or ListArgs but create a lot of object
+		// allocations.
+		return false
+	case *ConvertType: // we should not rewrite the type description
+		return false
 	}
-	return true, nil
+	return nz.err == nil // only continue if we haven't found any errors
 }
 
 // WalkSelect normalizes the AST in Select mode.
-func (nz *normalizer) WalkSelect(node SQLNode) (bool, error) {
-	switch node := node.(type) {
-	case *SQLVal:
-		nz.convertSQLValDedup(node)
+func (nz *normalizer) WalkSelect(cursor *Cursor) bool {
+	switch node := cursor.Node().(type) {
+	case *Literal:
+		nz.convertLiteralDedup(node, cursor)
 	case *ComparisonExpr:
 		nz.convertComparison(node)
+	case *ColName, TableName:
+		// Common node types that never contain Literals or ListArgs but create a lot of object
+		// allocations.
+		return false
+	case OrderBy, GroupBy:
+		// do not make a bind var for order by column_position
+		return false
+	case *ConvertType:
+		// we should not rewrite the type description
+		return false
 	}
-	return true, nil
+	return nz.err == nil // only continue if we haven't found any errors
 }
 
-func (nz *normalizer) convertSQLValDedup(node *SQLVal) {
+func (nz *normalizer) convertLiteralDedup(node *Literal, cursor *Cursor) {
 	// If value is too long, don't dedup.
 	// Such values are most likely not for vindexes.
 	// We save a lot of CPU because we avoid building
 	// the key for them.
 	if len(node.Val) > 256 {
-		nz.convertSQLVal(node)
+		nz.convertLiteral(node, cursor)
 		return
 	}
 
@@ -102,39 +117,37 @@ func (nz *normalizer) convertSQLValDedup(node *SQLVal) {
 
 	// Check if there's a bindvar for that value already.
 	var key string
-	if bval.Type == sqltypes.VarBinary {
+	if bval.Type == sqltypes2.VarBinary || bval.Type == sqltypes2.VarChar {
 		// Prefixing strings with "'" ensures that a string
 		// and number that have the same representation don't
 		// collide.
-		key = "'" + string(node.Val)
+		key = "'" + node.Val
 	} else {
-		key = string(node.Val)
+		key = node.Val
 	}
 	bvname, ok := nz.vals[key]
 	if !ok {
 		// If there's no such bindvar, make a new one.
-		bvname = nz.newName()
+		bvname = nz.reserved.nextUnusedVar()
 		nz.vals[key] = bvname
 		nz.bindVars[bvname] = bval
 	}
 
 	// Modify the AST node to a bindvar.
-	node.Type = ValArg
-	node.Val = append([]byte(":"), bvname...)
+	cursor.Replace(NewArgument(bvname))
 }
 
-// convertSQLVal converts an SQLVal without the dedup.
-func (nz *normalizer) convertSQLVal(node *SQLVal) {
+// convertLiteral converts an Literal without the dedup.
+func (nz *normalizer) convertLiteral(node *Literal, cursor *Cursor) {
 	bval := nz.sqlToBindvar(node)
 	if bval == nil {
 		return
 	}
 
-	bvname := nz.newName()
+	bvname := nz.reserved.nextUnusedVar()
 	nz.bindVars[bvname] = bval
 
-	node.Type = ValArg
-	node.Val = append([]byte(":"), bvname...)
+	cursor.Replace(NewArgument(bvname))
 }
 
 // convertComparison attempts to convert IN clauses to
@@ -143,7 +156,7 @@ func (nz *normalizer) convertSQLVal(node *SQLVal) {
 // and iterate on converting each individual value into separate
 // bind vars.
 func (nz *normalizer) convertComparison(node *ComparisonExpr) {
-	if node.Operator != InStr && node.Operator != NotInStr {
+	if node.Operator != InOp && node.Operator != NotInOp {
 		return
 	}
 	tupleVals, ok := node.Right.(ValTuple)
@@ -165,58 +178,60 @@ func (nz *normalizer) convertComparison(node *ComparisonExpr) {
 			Value: bval.Value,
 		})
 	}
-	bvname := nz.newName()
+	bvname := nz.reserved.nextUnusedVar()
 	nz.bindVars[bvname] = bvals
 	// Modify RHS to be a list bindvar.
-	node.Right = ListArg(append([]byte("::"), bvname...))
+	node.Right = ListArg(bvname)
 }
 
 func (nz *normalizer) sqlToBindvar(node SQLNode) *querypb.BindVariable {
-	if node, ok := node.(*SQLVal); ok {
-		var v sqltypes.Value
+	if node, ok := node.(*Literal); ok {
+		var v sqltypes2.Value
 		var err error
 		switch node.Type {
 		case StrVal:
-			v, err = sqltypes.NewValue(sqltypes.VarBinary, node.Val)
+			v, err = sqltypes2.NewValue(sqltypes2.VarChar, node.Bytes())
 		case IntVal:
-			v, err = sqltypes.NewValue(sqltypes.Int64, node.Val)
+			v, err = sqltypes2.NewValue(sqltypes2.Int64, node.Bytes())
 		case FloatVal:
-			v, err = sqltypes.NewValue(sqltypes.Float64, node.Val)
+			v, err = sqltypes2.NewValue(sqltypes2.Float64, node.Bytes())
+		case DecimalVal:
+			v, err = sqltypes2.NewValue(sqltypes2.Decimal, node.Bytes())
+		case HexNum:
+			v, err = sqltypes2.NewValue(sqltypes2.HexNum, node.Bytes())
+		case HexVal:
+			// We parse the `x'7b7d'` string literal into a hex encoded string of `7b7d` in the parser
+			// We need to re-encode it back to the original MySQL query format before passing it on as a bindvar value to MySQL
+			var vbytes []byte
+			vbytes, err = node.encodeHexValToMySQLQueryFormat()
+			if err != nil {
+				return nil
+			}
+			v, err = sqltypes2.NewValue(sqltypes2.HexVal, vbytes)
 		default:
 			return nil
 		}
 		if err != nil {
 			return nil
 		}
-		return sqltypes.ValueBindVariable(v)
+		return sqltypes2.ValueBindVariable(v)
 	}
 	return nil
 }
 
-func (nz *normalizer) newName() string {
-	for {
-		newName := fmt.Sprintf("%s%d", nz.prefix, nz.counter)
-		if _, ok := nz.reserved[newName]; !ok {
-			nz.reserved[newName] = struct{}{}
-			return newName
-		}
-		nz.counter++
-	}
-}
-
 // GetBindvars returns a map of the bind vars referenced in the statement.
-// TODO(sougou); This function gets called again from vtgate/planbuilder.
-// Ideally, this should be done only once.
 func GetBindvars(stmt Statement) map[string]struct{} {
 	bindvars := make(map[string]struct{})
 	_ = Walk(func(node SQLNode) (kontinue bool, err error) {
 		switch node := node.(type) {
-		case *SQLVal:
-			if node.Type == ValArg {
-				bindvars[string(node.Val[1:])] = struct{}{}
-			}
+		case *ColName, TableName:
+			// Common node types that never contain expressions but create a lot of object
+			// allocations.
+			return false, nil
+		case Argument:
+			bindvars[string(node)] = struct{}{}
 		case ListArg:
-			bindvars[string(node[2:])] = struct{}{}
+			bindvars[string(node)] = struct{}{}
 		}
 		return true, nil
 	}, stmt)

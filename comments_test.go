@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,11 @@ limitations under the License.
 package sqlparser
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestSplitComments(t *testing.T) {
@@ -119,20 +122,32 @@ func TestSplitComments(t *testing.T) {
 		outSQL:              "foo",
 		outLeadingComments:  "",
 		outTrailingComments: "",
+	}, {
+		input:               "select 1 from t where col = '*//*'",
+		outSQL:              "select 1 from t where col = '*//*'",
+		outLeadingComments:  "",
+		outTrailingComments: "",
+	}, {
+		input:               "/*! select 1 */",
+		outSQL:              "/*! select 1 */",
+		outLeadingComments:  "",
+		outTrailingComments: "",
 	}}
 	for _, testCase := range testCases {
-		gotSQL, gotComments := SplitMarginComments(testCase.input)
-		gotLeadingComments, gotTrailingComments := gotComments.Leading, gotComments.Trailing
+		t.Run(testCase.input, func(t *testing.T) {
+			gotSQL, gotComments := SplitMarginComments(testCase.input)
+			gotLeadingComments, gotTrailingComments := gotComments.Leading, gotComments.Trailing
 
-		if gotSQL != testCase.outSQL {
-			t.Errorf("test input: '%s', got SQL\n%+v, want\n%+v", testCase.input, gotSQL, testCase.outSQL)
-		}
-		if gotLeadingComments != testCase.outLeadingComments {
-			t.Errorf("test input: '%s', got LeadingComments\n%+v, want\n%+v", testCase.input, gotLeadingComments, testCase.outLeadingComments)
-		}
-		if gotTrailingComments != testCase.outTrailingComments {
-			t.Errorf("test input: '%s', got TrailingComments\n%+v, want\n%+v", testCase.input, gotTrailingComments, testCase.outTrailingComments)
-		}
+			if gotSQL != testCase.outSQL {
+				t.Errorf("test input: '%s', got SQL\n%+v, want\n%+v", testCase.input, gotSQL, testCase.outSQL)
+			}
+			if gotLeadingComments != testCase.outLeadingComments {
+				t.Errorf("test input: '%s', got LeadingComments\n%+v, want\n%+v", testCase.input, gotLeadingComments, testCase.outLeadingComments)
+			}
+			if gotTrailingComments != testCase.outTrailingComments {
+				t.Errorf("test input: '%s', got TrailingComments\n%+v, want\n%+v", testCase.input, gotTrailingComments, testCase.outTrailingComments)
+			}
+		})
 	}
 }
 
@@ -187,7 +202,7 @@ bar`,
 		outSQL: "bar",
 	}, {
 		input:  "-- /* foo */ bar",
-		outSQL: "-- /* foo */ bar",
+		outSQL: "",
 	}, {
 		input:  "foo -- bar */",
 		outSQL: "foo -- bar */",
@@ -201,7 +216,7 @@ a`,
 		outSQL: "a",
 	}, {
 		input:  `-- foo bar`,
-		outSQL: "-- foo bar",
+		outSQL: "",
 	}}
 	for _, testCase := range testCases {
 		gotSQL := StripLeadingComments(testCase.input)
@@ -303,14 +318,43 @@ func TestExtractCommentDirectives(t *testing.T) {
 	}}
 
 	for _, testCase := range testCases {
-		sql := "select " + testCase.input + " 1 from dual"
-		stmt, _ := Parse(sql)
-		comments := stmt.(*Select).Comments
-		vals := ExtractCommentDirectives(comments)
+		t.Run(testCase.input, func(t *testing.T) {
+			sqls := []string{
+				"select " + testCase.input + " 1 from dual",
+				"update " + testCase.input + " t set i=i+1",
+				"delete " + testCase.input + " from t where id>1",
+				"drop " + testCase.input + " table t",
+				"create " + testCase.input + " table if not exists t (id int primary key)",
+				"alter " + testCase.input + " table t add column c int not null",
+			}
+			for _, sql := range sqls {
+				t.Run(sql, func(t *testing.T) {
+					var comments Comments
+					stmt, _ := Parse(sql)
+					switch s := stmt.(type) {
+					case *Select:
+						comments = s.Comments
+					case *Update:
+						comments = s.Comments
+					case *Delete:
+						comments = s.Comments
+					case *DropTable:
+						comments = s.Comments
+					case *AlterTable:
+						comments = s.Comments
+					case *CreateTable:
+						comments = s.Comments
+					default:
+						t.Errorf("Unexpected statement type %+v", s)
+					}
+					vals := ExtractCommentDirectives(comments)
 
-		if !reflect.DeepEqual(vals, testCase.vals) {
-			t.Errorf("test input: '%v', got vals:\n%+v, want\n%+v", testCase.input, vals, testCase.vals)
-		}
+					if !reflect.DeepEqual(vals, testCase.vals) {
+						t.Errorf("test input: '%v', got vals:\n%+v, want\n%+v", testCase.input, vals, testCase.vals)
+					}
+				})
+			}
+		})
 	}
 
 	d := CommentDirectives{
@@ -371,5 +415,57 @@ func TestSkipQueryPlanCacheDirective(t *testing.T) {
 	stmt, _ = Parse("delete /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ from users")
 	if !SkipQueryPlanCacheDirective(stmt) {
 		t.Errorf("d.SkipQueryPlanCacheDirective(stmt) should be true")
+	}
+}
+
+func TestIgnoreMaxPayloadSizeDirective(t *testing.T) {
+	testCases := []struct {
+		query    string
+		expected bool
+	}{
+		{"insert /*vt+ IGNORE_MAX_PAYLOAD_SIZE=1 */ into user(id) values (1), (2)", true},
+		{"insert into user(id) values (1), (2)", false},
+		{"update /*vt+ IGNORE_MAX_PAYLOAD_SIZE=1 */ users set name=1", true},
+		{"update users set name=1", false},
+		{"select /*vt+ IGNORE_MAX_PAYLOAD_SIZE=1 */ * from users", true},
+		{"select * from users", false},
+		{"delete /*vt+ IGNORE_MAX_PAYLOAD_SIZE=1 */ from users", true},
+		{"delete from users", false},
+		{"show /*vt+ IGNORE_MAX_PAYLOAD_SIZE=1 */ create table users", false},
+		{"show create table users", false},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.query, func(t *testing.T) {
+			stmt, _ := Parse(test.query)
+			got := IgnoreMaxPayloadSizeDirective(stmt)
+			assert.Equalf(t, test.expected, got, fmt.Sprintf("IgnoreMaxPayloadSizeDirective(stmt) returned %v but expected %v", got, test.expected))
+		})
+	}
+}
+
+func TestIgnoreMaxMaxMemoryRowsDirective(t *testing.T) {
+	testCases := []struct {
+		query    string
+		expected bool
+	}{
+		{"insert /*vt+ IGNORE_MAX_MEMORY_ROWS=1 */ into user(id) values (1), (2)", true},
+		{"insert into user(id) values (1), (2)", false},
+		{"update /*vt+ IGNORE_MAX_MEMORY_ROWS=1 */ users set name=1", true},
+		{"update users set name=1", false},
+		{"select /*vt+ IGNORE_MAX_MEMORY_ROWS=1 */ * from users", true},
+		{"select * from users", false},
+		{"delete /*vt+ IGNORE_MAX_MEMORY_ROWS=1 */ from users", true},
+		{"delete from users", false},
+		{"show /*vt+ IGNORE_MAX_MEMORY_ROWS=1 */ create table users", false},
+		{"show create table users", false},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.query, func(t *testing.T) {
+			stmt, _ := Parse(test.query)
+			got := IgnoreMaxMaxMemoryRowsDirective(stmt)
+			assert.Equalf(t, test.expected, got, fmt.Sprintf("IgnoreMaxPayloadSizeDirective(stmt) returned %v but expected %v", got, test.expected))
+		})
 	}
 }

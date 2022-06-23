@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package sqlparser
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
@@ -30,6 +31,18 @@ const (
 	DirectiveSkipQueryPlanCache = "SKIP_QUERY_PLAN_CACHE"
 	// DirectiveQueryTimeout sets a query timeout in vtgate. Only supported for SELECTS.
 	DirectiveQueryTimeout = "QUERY_TIMEOUT_MS"
+	// DirectiveScatterErrorsAsWarnings enables partial success scatter select queries
+	DirectiveScatterErrorsAsWarnings = "SCATTER_ERRORS_AS_WARNINGS"
+	// DirectiveIgnoreMaxPayloadSize skips payload size validation when set.
+	DirectiveIgnoreMaxPayloadSize = "IGNORE_MAX_PAYLOAD_SIZE"
+	// DirectiveIgnoreMaxMemoryRows skips memory row validation when set.
+	DirectiveIgnoreMaxMemoryRows = "IGNORE_MAX_MEMORY_ROWS"
+	// DirectiveAllowScatter lets scatter plans pass through even when they are turned off by `no-scatter`.
+	DirectiveAllowScatter = "ALLOW_SCATTER"
+	// DirectiveAllowHashJoin lets the planner use hash join if possible
+	DirectiveAllowHashJoin = "ALLOW_HASH_JOIN"
+	// DirectiveQueryPlanner lets the user specify per query which planner should be used
+	DirectiveQueryPlanner = "PLANNER"
 )
 
 func isNonSpace(r rune) bool {
@@ -53,7 +66,7 @@ func leadingCommentEnd(text string) (end int) {
 
 		// Found visible characters. Look for '/*' at the beginning
 		// and '*/' somewhere after that.
-		if len(remainingText) < 4 || remainingText[:2] != "/*" {
+		if len(remainingText) < 4 || remainingText[:2] != "/*" || remainingText[2] == '!' {
 			break
 		}
 		commentLength := 4 + strings.Index(remainingText[2:], "*/")
@@ -91,8 +104,8 @@ func trailingCommentStart(text string) (start int) {
 
 		// Find the beginning of the comment
 		startCommentPos := strings.LastIndex(text[:reducedLen-2], "/*")
-		if startCommentPos < 0 {
-			// Badly formatted sql :/
+		if startCommentPos < 0 || text[startCommentPos+2] == '!' {
+			// Badly formatted sql, or a special /*! comment
 			break
 		}
 
@@ -121,7 +134,9 @@ func SplitMarginComments(sql string) (query string, comments MarginComments) {
 		Leading:  strings.TrimLeftFunc(sql[:leadingEnd], unicode.IsSpace),
 		Trailing: strings.TrimRightFunc(sql[trailingStart:], unicode.IsSpace),
 	}
-	return strings.TrimFunc(sql[leadingEnd:trailingStart], unicode.IsSpace), comments
+	return strings.TrimFunc(sql[leadingEnd:trailingStart], func(c rune) bool {
+		return unicode.IsSpace(c) || c == ';'
+	}), comments
 }
 
 // StripLeadingComments trims the SQL string and removes any leading comments
@@ -145,7 +160,7 @@ func StripLeadingComments(sql string) string {
 			// Single line comment
 			index := strings.Index(sql, "\n")
 			if index == -1 {
-				return sql
+				return ""
 			}
 			sql = sql[index+1:]
 		}
@@ -162,7 +177,7 @@ func hasCommentPrefix(sql string) bool {
 
 // ExtractMysqlComment extracts the version and SQL from a comment-only query
 // such as /*!50708 sql here */
-func ExtractMysqlComment(sql string) (version string, innerSQL string) {
+func ExtractMysqlComment(sql string) (string, string) {
 	sql = sql[3 : len(sql)-2]
 
 	digitCount := 0
@@ -170,8 +185,14 @@ func ExtractMysqlComment(sql string) (version string, innerSQL string) {
 		digitCount++
 		return !unicode.IsDigit(c) || digitCount == 6
 	})
-	version = sql[0:endOfVersionIndex]
-	innerSQL = strings.TrimFunc(sql[endOfVersionIndex:], unicode.IsSpace)
+	if endOfVersionIndex < 0 {
+		return "", ""
+	}
+	if endOfVersionIndex < 5 {
+		endOfVersionIndex = 0
+	}
+	version := sql[0:endOfVersionIndex]
+	innerSQL := strings.TrimFunc(sql[endOfVersionIndex:], unicode.IsSpace)
 
 	return version, innerSQL
 }
@@ -195,8 +216,7 @@ func ExtractCommentDirectives(comments Comments) CommentDirectives {
 
 	var vals map[string]interface{}
 
-	for _, comment := range comments {
-		commentStr := string(comment)
+	for _, commentStr := range comments {
 		if commentStr[0:5] != commentDirectivePreamble {
 			continue
 		}
@@ -263,6 +283,43 @@ func (d CommentDirectives) IsSet(key string) bool {
 	return false
 }
 
+// GetString gets a directive value as string, with default value if not found
+func (d CommentDirectives) GetString(key string, defaultVal string) string {
+	val, ok := d[key]
+	if !ok {
+		return defaultVal
+	}
+	stringVal := fmt.Sprintf("%v", val)
+	if unquoted, err := strconv.Unquote(stringVal); err == nil {
+		stringVal = unquoted
+	}
+	return stringVal
+}
+
+// MultiShardAutocommitDirective returns true if multishard autocommit directive is set to true in query.
+func MultiShardAutocommitDirective(stmt Statement) bool {
+	switch stmt := stmt.(type) {
+	case *Insert:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		if directives.IsSet(DirectiveMultiShardAutocommit) {
+			return true
+		}
+	case *Update:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		if directives.IsSet(DirectiveMultiShardAutocommit) {
+			return true
+		}
+	case *Delete:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		if directives.IsSet(DirectiveMultiShardAutocommit) {
+			return true
+		}
+	default:
+		return false
+	}
+	return false
+}
+
 // SkipQueryPlanCacheDirective returns true if skip query plan cache directive is set to true in query.
 func SkipQueryPlanCacheDirective(stmt Statement) bool {
 	switch stmt := stmt.(type) {
@@ -290,4 +347,68 @@ func SkipQueryPlanCacheDirective(stmt Statement) bool {
 		return false
 	}
 	return false
+}
+
+// IgnoreMaxPayloadSizeDirective returns true if the max payload size override
+// directive is set to true.
+func IgnoreMaxPayloadSizeDirective(stmt Statement) bool {
+	switch stmt := stmt.(type) {
+	// For transactional statements, they should always be passed down and
+	// should not come into max payload size requirement.
+	case *Begin, *Commit, *Rollback, *Savepoint, *SRollback, *Release:
+		return true
+	case *Select:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxPayloadSize)
+	case *Insert:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxPayloadSize)
+	case *Update:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxPayloadSize)
+	case *Delete:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxPayloadSize)
+	default:
+		return false
+	}
+}
+
+// IgnoreMaxMaxMemoryRowsDirective returns true if the max memory rows override
+// directive is set to true.
+func IgnoreMaxMaxMemoryRowsDirective(stmt Statement) bool {
+	switch stmt := stmt.(type) {
+	case *Select:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxMemoryRows)
+	case *Insert:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxMemoryRows)
+	case *Update:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxMemoryRows)
+	case *Delete:
+		directives := ExtractCommentDirectives(stmt.Comments)
+		return directives.IsSet(DirectiveIgnoreMaxMemoryRows)
+	default:
+		return false
+	}
+}
+
+// AllowScatterDirective returns true if the allow scatter override is set to true
+func AllowScatterDirective(stmt Statement) bool {
+	var directives CommentDirectives
+	switch stmt := stmt.(type) {
+	case *Select:
+		directives = ExtractCommentDirectives(stmt.Comments)
+	case *Insert:
+		directives = ExtractCommentDirectives(stmt.Comments)
+	case *Update:
+		directives = ExtractCommentDirectives(stmt.Comments)
+	case *Delete:
+		directives = ExtractCommentDirectives(stmt.Comments)
+	default:
+		return false
+	}
+	return directives.IsSet(DirectiveAllowScatter)
 }
